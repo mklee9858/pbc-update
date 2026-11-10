@@ -1,0 +1,6 @@
+# 공개 저장소에는 소개 문서만 허용합니다.
+*
+!/.gitignore
+!/README.md
+!/USAGE.md
+!/RELEASE_NOTES.md
