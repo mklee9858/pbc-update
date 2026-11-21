@@ -77,7 +77,7 @@ jobs:
               raise SystemExit("Provide passed functional checks and patch notes.")
 
           tag = f"v{version}"
-          executable = prefix + "_" + version.replace(".", "_") + ".exe"
+          executable = prefix + "_v" + version.replace(".", "_") + ".exe"
           body = "\n".join([
               *[f"- {change}" for change in changes],
               "",
