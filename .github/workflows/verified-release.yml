@@ -1,0 +1,156 @@
+name: Publish verified version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, such as 2.18.0 (without v)'
+        required: true
+        type: string
+      verified_sha256:
+        description: 'SHA-256 of the executable used in the passed tests'
+        required: true
+        type: string
+      tests_passed:
+        description: 'I tested this exact executable and all release checks passed'
+        required: true
+        default: false
+        type: boolean
+      verification:
+        description: 'Public-safe summary of the passed functional checks'
+        required: true
+        type: string
+      changes:
+        description: 'Public-safe patch notes for this version'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verified-version
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' && inputs.tests_passed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify and record release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          VERIFIED_SHA256: ${{ inputs.verified_sha256 }}
+          VERIFICATION: ${{ inputs.verification }}
+          CHANGES: ${{ inputs.changes }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          projects = {
+              "mklee9858/audit-report-checker": ("AuditReportChecker", (2, 17, 2)),
+              "mklee9858/pbc-update": ("PBC_Update", (1, 6, 2)),
+          }
+          prefix, baseline = projects[os.environ["GITHUB_REPOSITORY"]]
+          version = os.environ["VERSION"].strip()
+          expected = os.environ["VERIFIED_SHA256"].strip().lower()
+          verification = os.environ["VERIFICATION"].split()
+          changes = [line.strip() for line in os.environ["CHANGES"].splitlines() if line.strip()]
+          pattern = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+          if not re.fullmatch(pattern, version) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+              raise SystemExit("Enter a stable X.Y.Z version and a valid SHA-256.")
+          if not verification or not changes:
+              raise SystemExit("Provide passed functional checks and patch notes.")
+
+          tag = f"v{version}"
+          executable = prefix + "_" + version.replace(".", "_") + ".exe"
+          body = "\n".join([
+              *[f"- {change}" for change in changes],
+              "",
+              f"검증 결과 — {' '.join(verification)}",
+              f"실행파일 — [{executable}](https://github.com/{os.environ['GITHUB_REPOSITORY']}/raw/{tag}/{executable})",
+              f"SHA-256 — `{expected}`",
+          ])
+          heading = f"## {tag}"
+          entry = f"{heading}\n\n{body}"
+          changelog = Path("CHANGELOG.md")
+
+          tags = git("tag", "--list").splitlines()
+          if tag in tags:
+              target = git("rev-parse", f"refs/tags/{tag}^{{commit}}")
+              tagged_log = git("show", f"{target}:CHANGELOG.md")
+              sections = re.split(r"(?m)(?=^## v[0-9])", tagged_log)
+              if entry not in [section.strip() for section in sections]:
+                  raise SystemExit("Existing tag has different release notes.")
+              subprocess.run(["git", "merge-base", "--is-ancestor", target, "origin/main"], check=True)
+              git("checkout", "--detach", target)
+          else:
+              versions = [baseline]
+              for existing in tags:
+                  match = re.fullmatch(r"v?" + pattern, existing)
+                  if match:
+                      versions.append(tuple(map(int, match.groups())))
+              if tuple(map(int, version.split("."))) <= max(versions):
+                  raise SystemExit("Version must be greater than all existing stable versions.")
+              if git("rev-parse", "origin/main") != os.environ["GITHUB_SHA"]:
+                  raise SystemExit("main advanced. Check the candidate and start a fresh run.")
+
+          asset = Path(executable)
+          if not asset.is_file() or asset.is_symlink():
+              raise SystemExit(f"Missing release executable: {executable}")
+          with asset.open("rb") as stream:
+              actual = hashlib.file_digest(stream, "sha256").hexdigest()
+          if actual != expected:
+              raise SystemExit("Executable does not match the tested SHA-256.")
+          declared = [
+              line.split()[0].lower()
+              for line in Path("SHA256SUMS.txt").read_text(encoding="utf-8-sig").splitlines()
+              if len(line.split()) == 2 and line.split()[1].lstrip("*") == executable
+          ]
+          if declared != [expected]:
+              raise SystemExit("SHA256SUMS.txt must contain one matching entry for the executable.")
+
+          if tag not in tags:
+              title = "# 변경 이력"
+              existing = changelog.read_text(encoding="utf-8") if changelog.exists() else title
+              first_line, _, history = existing.partition("\n")
+              if first_line != title or any(line.strip() == heading for line in history.splitlines()):
+                  raise SystemExit("Unexpected changelog format or duplicate version.")
+              changelog.write_text(f"{title}\n\n{entry}\n\n{history.strip()}".rstrip() + "\n", encoding="utf-8")
+              git("config", "user.name", "github-actions[bot]")
+              git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+              git("add", "--", str(changelog))
+              git("commit", "-m", f"Record verified release {tag}")
+              git("tag", "-a", tag, "-m", f"Verified release {tag}")
+              git("push", "--atomic", "origin", "HEAD:refs/heads/main", f"refs/tags/{tag}")
+
+          release = subprocess.run(
+              ["gh", "release", "view", tag, "--json", "isDraft,isPrerelease,body"],
+              capture_output=True, text=True,
+          )
+          if release.returncode == 0:
+              import json
+              existing_release = json.loads(release.stdout)
+              if (existing_release["isDraft"] or existing_release["isPrerelease"]
+                      or existing_release["body"].strip() != body):
+                  raise SystemExit("An existing GitHub Release requires review.")
+          else:
+              subprocess.run(
+                  ["gh", "release", "create", tag, "--verify-tag", "--title", tag, "--notes-file", "-"],
+                  input=body, text=True, check=True,
+              )
+          PY
